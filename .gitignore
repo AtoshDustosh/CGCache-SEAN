@@ -1,0 +1,40 @@
+# Ignore possible large files
+*.pkl
+*.npy
+*.csv
+*.log
+*.json
+*.db
+*.parquet
+
+# Ignore compressed files
+*.zip
+*.tar.gz
+
+# Ignore log files
+*.log
+*.out
+
+# Ignore all files in __pycache__ folders
+__pycache__/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore temporary files
+*.tmp
+*.bak
+
+# Ignore environment files
+.env
+*.env
+requirements.txt
+
+# Ignore virtual environment folders
+venv/
+.env/
+
+# Ignore wandb files
+*.wandb
+settings
+
