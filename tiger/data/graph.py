@@ -90,9 +90,9 @@ class Graph:
         self,
         nids: np.ndarray,
         ts: np.ndarray,
-        n_neighbors: int = 20,
+        n_neighbors: int = 10,
         strategy: Optional[str] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Extract 'n_neighbors' edges for each (nid, t) pair
         TODO: Bottleneck! Total time >50%
@@ -120,7 +120,9 @@ class Graph:
         batch_degree = np.zeros([bs, n_neighbors], dtype=np.float32)
 
         for i, (nid, t) in enumerate(zip(nids, ts)):
-            local_neighbors, local_eids, local_ts, local_dirs = self.find_before(nid, t)
+            local_neighbors, local_eids, local_tss, local_dirs = self.find_before(
+                nid, t
+            )
 
             if len(local_neighbors) == 0:  # no neighbors, use default null values
                 continue
@@ -139,7 +141,7 @@ class Graph:
                 if strategy == "uniform" or math.isclose(self.alpha, 0):
                     sampled_idx = self.rng.randint(0, len(local_neighbors), n_neighbors)
                 else:
-                    time_delta = t - local_ts
+                    time_delta = t - local_tss
                     sampling_weight = np.exp(-self.alpha * time_delta)
                     sampling_weight = (
                         sampling_weight / sampling_weight.sum()
@@ -151,16 +153,15 @@ class Graph:
                         p=sampling_weight,
                     )
                 # sort by time
-                sort_idx = local_ts[sampled_idx].argsort()
+                sort_idx = local_tss[sampled_idx].argsort()
                 batch_neighbors[i, :] = local_neighbors[sampled_idx][sort_idx]
                 batch_eids[i, :] = local_eids[sampled_idx][sort_idx]
-                batch_ts[i, :] = local_ts[sampled_idx][sort_idx]
+                batch_ts[i, :] = local_tss[sampled_idx][sort_idx]
                 batch_dirs[i, :] = local_dirs[sampled_idx][sort_idx]
-
             elif strategy == "recent_edges":
                 local_neighbors = local_neighbors[-n_neighbors:]
                 local_eids = local_eids[-n_neighbors:]
-                local_ts = local_ts[-n_neighbors:]
+                local_tss = local_tss[-n_neighbors:]
                 local_dirs = local_dirs[-n_neighbors:]
                 local_re = local_re[-n_neighbors:]
                 len_hist = len(local_neighbors)
@@ -168,11 +169,10 @@ class Graph:
                 # The first (n_neighbors - len_hist) are filled with default null values
                 batch_neighbors[i, n_neighbors - len_hist :] = local_neighbors
                 batch_eids[i, n_neighbors - len_hist :] = local_eids
-                batch_ts[i, n_neighbors - len_hist :] = local_ts
+                batch_ts[i, n_neighbors - len_hist :] = local_tss
                 batch_dirs[i, n_neighbors - len_hist :] = local_dirs
                 batch_re[i, n_neighbors - len_hist :] = local_re
                 batch_degree[i, n_neighbors - len_hist :] = node_degree
-
             elif strategy == "recent_nodes":
                 _, unique_idx = np.unique(
                     local_neighbors[::-1], return_index=True
@@ -183,16 +183,15 @@ class Graph:
 
                 local_neighbors = local_neighbors[unique_idx][-n_neighbors:]
                 local_eids = local_eids[unique_idx][-n_neighbors:]
-                local_ts = local_ts[unique_idx][-n_neighbors:]
+                local_tss = local_tss[unique_idx][-n_neighbors:]
                 local_dirs = local_dirs[unique_idx][-n_neighbors:]
                 len_hist = len(local_neighbors)
 
                 # The first (n_neighbors - len_hist) are filled with default null values
                 batch_neighbors[i, n_neighbors - len_hist :] = local_neighbors
                 batch_eids[i, n_neighbors - len_hist :] = local_eids
-                batch_ts[i, n_neighbors - len_hist :] = local_ts
+                batch_ts[i, n_neighbors - len_hist :] = local_tss
                 batch_dirs[i, n_neighbors - len_hist :] = local_dirs
-
             else:
                 raise NotImplementedError
 

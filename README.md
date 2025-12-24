@@ -2,7 +2,7 @@
 
 ## Base Test Framework
 
-TIGER (2023, WWW): A TGNN model with adaptive neighborhood sampling.
+SEAN (2024, KDD): A TGNN model with adaptive neighborhood sampling.
 
 Some implementation details:
 - Class `NumericalFeature` moves all edge and node features to GPU before model computation.

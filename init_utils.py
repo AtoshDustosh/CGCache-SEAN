@@ -30,7 +30,7 @@ def init_parser():
     parser.add_argument(
         "-d", "--data", type=str, default="wikipedia", help="Dataset name"
     )
-    parser.add_argument("--root", type=str, default=".", help="Dataset root")
+    parser.add_argument("--root", type=str, default="/workspaces/CGCache-SEAN/", help="Dataset root")
     parser.add_argument("--dim", type=int, default=None, help="Feature dimension")
     parser.add_argument(
         "--no_feat_buffer", action="store_true", help="Do not pre-load data into GPU"
@@ -176,7 +176,7 @@ def init_data(
             batch_size=bs,
             sampler=train_sampler,
             collate_fn=train_collator,
-            pin_memory=True,
+            pin_memory=False,
         )  # distributed Dataloader
         offline_dl = None
     else:
@@ -184,7 +184,7 @@ def init_data(
             train_data,
             batch_size=bs,
             collate_fn=train_collator,
-            pin_memory=True,
+            pin_memory=False,
             num_workers=num_workers,
         )
         if subset < 1.0:

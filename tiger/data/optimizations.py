@@ -45,6 +45,8 @@ class CGCache:
         self.slots_nids = [torch.zeros([])]
         self.slots_eids = [torch.zeros([])]
         self.slots_tss = [torch.zeros([])]
+        self.slots_res = [torch.zeros([])]
+        self.slots_degs = [torch.zeros([])]
         self.offsets = torch.zeros([self.cap], device=self.device, dtype=torch.long)
 
         # Initialize cached layers: layer 1 -> layer L
@@ -60,6 +62,16 @@ class CGCache:
                     [self.cap, self.k**l], device=self.device, dtype=torch.float
                 )
             )
+            self.slots_res.append(
+                torch.zeros(
+                    [self.cap, self.k**l], device=self.device, dtype=torch.float
+                )
+            )
+            self.slots_degs.append(
+                torch.zeros(
+                    [self.cap, self.k**l], device=self.device, dtype=torch.float
+                )
+            )
 
         # Cache slot index
         # We use a CPU dict because querying for a single batch is usually fast
@@ -68,8 +80,8 @@ class CGCache:
 
         # Some buffers to avoid redundant memory allocation
         self.buf_offset = torch.zeros([self.cap], device=self.device, dtype=torch.long)
-        self.bufs_long = []
-        self.bufs_float = []
+        self.bufs_long = [torch.zeros([])]
+        self.bufs_float = [torch.zeros([])]
         for l in range(1, self.L + 1):
             self.bufs_long.append(
                 torch.zeros([self.cap, self.k**l], device=self.device, dtype=torch.long)
@@ -180,7 +192,13 @@ class CGCache:
 
         # Initialize the 0-th layer
         t_cached_nids = torch.from_numpy(unicached_nids).long().to(self.device)
-        cached_layers[0] = [t_cached_nids, [], []]
+        cached_layers[0] = [
+            t_cached_nids,  # nid
+            torch.tensor([]),  # eid
+            torch.tensor([]),  # ts
+            torch.tensor([]),  # re
+            torch.tensor([]),  # deg
+        ]
 
         # Gather other L layers of CGs
         for l in range(1, self.L + 1):
@@ -195,6 +213,8 @@ class CGCache:
                 self.slots_nids[l][cached_slots].gather(1, index).view(-1, self.k),
                 self.slots_eids[l][cached_slots].gather(1, index).view(-1, self.k),
                 self.slots_tss[l][cached_slots].gather(1, index).view(-1, self.k),
+                self.slots_res[l][cached_slots].gather(1, index).view(-1, self.k),
+                self.slots_degs[l][cached_slots].gather(1, index).view(-1, self.k),
             ]
             pass
         return cached_layers
@@ -260,24 +280,30 @@ class CGCache:
             device=self.device,
         )
 
-        # # Reorder slot data and offsets after cache eviction
-        # self.offsets = self.offsets[reorder_index]
-        # for l in range(1, self.L + 1):
-        #     self.slots_nids[l] = self.slots_nids[l][reorder_index]
-        #     self.slots_eids[l] = self.slots_eids[l][reorder_index]
-        #     self.slots_tss[l] = self.slots_tss[l][reorder_index]
-
-        # OPT The buffer must have the same size as a slot
+        # Reorder slot data and offsets after cache eviction
+        """
+        The following code explains the basic logic:
+            self.offsets = self.offsets[reorder_index]
+            for l in range(1, self.L + 1):
+                self.slots_nids[l] = self.slots_nids[l][reorder_index]
+                self.slots_eids[l] = self.slots_eids[l][reorder_index]
+                self.slots_tss[l] = self.slots_tss[l][reorder_index]
+        As pytorch doesn't provide self scatter, we avoid repetitive memory allocation with persistent buffers.
+        """
         self.buf_offset.copy_(self.offsets)
         self.offsets.scatter_(0, reorder_index, self.buf_offset)
         for l in range(1, self.L + 1):
             tmp_index = reorder_index.unsqueeze(-1).expand(-1, self.k**l)
-            self.bufs_long[l - 1].copy_(self.slots_nids[l])
-            self.slots_nids[l].scatter_(0, tmp_index, self.bufs_long[l - 1])
-            self.bufs_long[l - 1].copy_(self.slots_eids[l])
-            self.slots_eids[l].scatter_(0, tmp_index, self.bufs_long[l - 1])
-            self.bufs_float[l - 1].copy_(self.slots_tss[l])
-            self.slots_tss[l].scatter_(0, tmp_index, self.bufs_float[l - 1])
+            self.bufs_long[l].copy_(self.slots_nids[l])
+            self.slots_nids[l].scatter_(0, tmp_index, self.bufs_long[l])
+            self.bufs_long[l].copy_(self.slots_eids[l])
+            self.slots_eids[l].scatter_(0, tmp_index, self.bufs_long[l])
+            self.bufs_float[l].copy_(self.slots_tss[l])
+            self.slots_tss[l].scatter_(0, tmp_index, self.bufs_float[l])
+            self.bufs_float[l].copy_(self.slots_res[l])
+            self.slots_res[l].scatter_(0, tmp_index, self.bufs_float[l])
+            self.bufs_float[l].copy_(self.slots_degs[l])
+            self.slots_degs[l].scatter_(0, tmp_index, self.bufs_float[l])
             pass
 
         return mask_unimissed_put, unimissed_put_nids
@@ -316,6 +342,10 @@ class CGCache:
             self.slots_nids[l].index_copy_(
                 0,
                 unimissed_put_slots,
+                # "L + 1 - l" is used to match TIGER's twisted cg design
+                # ".view([-1, k**l])" is, again, because of TIGER's design for CGs.
+                # layer 0: [600], layer 1: [600, 10], layer 2: [6000, 10], ...
+                # TIGER arranges timestamps from left to right (old to new)
                 unimissed_layers[self.L + 1 - l][0].view([-1, self.k**l])[
                     t_mask_unimissed_put
                 ],
@@ -334,34 +364,20 @@ class CGCache:
                     t_mask_unimissed_put
                 ],
             )
-            """
-            put_index = unimissed_put_slots.unsqueeze(-1).expand(-1, self.k**l)
-            self.slots_nids[l].scatter_(
+            self.slots_res[l].index_copy_(
                 0,
-                put_index,
-                # "L + 1 - l" is used to match TIGER's twisted cg design
-                # ".view([-1, k**l])" is, again, because of TIGER's design for CGs.
-                # layer 0: [600], layer 1: [600, 10], layer 2: [6000, 10], ...
-                # TIGER arranges timestamps from left to right (old to new)
-                unimissed_layers[self.L + 1 - l][0].view([-1, self.k**l])[
+                unimissed_put_slots,
+                unimissed_layers[self.L + 1 - l][3].view([-1, self.k**l])[
                     t_mask_unimissed_put
                 ],
             )
-            self.slots_eids[l].scatter_(
+            self.slots_degs[l].index_copy_(
                 0,
-                put_index,
-                unimissed_layers[self.L + 1 - l][1].view([-1, self.k**l])[
+                unimissed_put_slots,
+                unimissed_layers[self.L + 1 - l][4].view([-1, self.k**l])[
                     t_mask_unimissed_put
                 ],
             )
-            self.slots_tss[l].scatter_(
-                0,
-                put_index,
-                unimissed_layers[self.L + 1 - l][2].view([-1, self.k**l])[
-                    t_mask_unimissed_put
-                ],
-            )
-            """
             pass
         pass
 
@@ -414,42 +430,75 @@ class CGCache:
         all_updates_nids = np.zeros([n_updated * self.k], dtype=int)
         all_updates_eids = np.zeros([n_updated * self.k], dtype=int)
         all_updates_tss = np.zeros([n_updated * self.k], dtype=float)
+        all_updates_res = np.zeros([n_updated * self.k], dtype=float)
+        all_updates_degs = np.zeros([n_updated * self.k], dtype=float)
         updated_nids = []
         for idx, (updated_nid, updates) in enumerate(updatables.items()):
             len_overwrite = min(len(updates[0]), self.k)
             updates_nids, updates_eids, updates_tss = updates
             # Truncate unnecessary neighbors
             all_updates_nids[idx * self.k : idx * self.k + len_overwrite] = (
-                updates_nids[:len_overwrite]
+                updates_nids[-len_overwrite:]
             )
             all_updates_eids[idx * self.k : idx * self.k + len_overwrite] = (
-                updates_eids[:len_overwrite]
+                updates_eids[-len_overwrite:]
             )
             all_updates_tss[idx * self.k : idx * self.k + len_overwrite] = updates_tss[
-                :len_overwrite
+                -len_overwrite:
             ]
+            # SEAN's neighbor reoccurrences and node degree
+            local_neighbors, _, _, _ = self.graph.find_before(updated_nid, min(tss))
+            _, inverse, cnts = np.unique(
+                local_neighbors, return_inverse=True, return_counts=True
+            )
+            local_res = cnts[inverse].astype(np.float32)[-len_overwrite:]
+            local_deg = len(local_neighbors)
+
+            all_updates_res[
+                idx * self.k : idx * self.k + min(len_overwrite, len(local_res))
+            ] = local_res
+            all_updates_degs[idx * self.k : idx * self.k + len_overwrite] = local_deg
+
             updated_nids.append(updated_nid)
         updated_nids = np.array(updated_nids)  # [n_updated]
 
         # Initialize the first two layers of incremental CGs
-        updated_layers: List[Tuple] = [(updated_nids, np.array([]), np.array([]))]
-        updated_layers.append((all_updates_nids, all_updates_eids, all_updates_tss))
+        updated_layers: List[Tuple] = [
+            (updated_nids, np.array([]), np.array([]), np.array([]), np.array([]))
+        ]
+        updated_layers.append(
+            (
+                all_updates_nids,
+                all_updates_eids,
+                all_updates_tss,
+                all_updates_res,
+                all_updates_degs,
+            )
+        )
 
         # Step 3: sample and initialize higher layers (layer depth >= 2)
         for l in range(2, self.L + 1):
-            layer_nids, layer_eids, layer_tss, *_ = self.graph.sample_temporal_neighbor(
-                updated_layers[l - 1][0], updated_layers[l - 1][2], self.k
+            layer_nids, layer_eids, layer_tss, _, layer_res, layer_degs = (
+                self.graph.sample_temporal_neighbor(
+                    updated_layers[l - 1][0], updated_layers[l - 1][2], self.k
+                )
             )
-            updated_layers.append((layer_nids, layer_eids, layer_tss))
+            updated_layers.append(
+                (layer_nids, layer_eids, layer_tss, layer_res, layer_degs)
+            )
             pass
 
         # Convert to tensors
         for depth in range(len(updated_layers)):
-            neigh_nids, neigh_eids, neigh_tss = updated_layers[depth]
+            neigh_nids, neigh_eids, neigh_tss, neigh_res, neigh_degs = updated_layers[
+                depth
+            ]
             updated_layers[depth] = (
                 torch.from_numpy(neigh_nids).to(self.device).long(),
                 torch.from_numpy(neigh_eids).to(self.device).long(),
                 torch.from_numpy(neigh_tss).to(self.device).float(),
+                torch.from_numpy(neigh_res).to(self.device).float(),
+                torch.from_numpy(neigh_degs).to(self.device).float(),
             )
             pass
 
@@ -465,19 +514,20 @@ class CGCache:
             .long()
             .to(self.device)
         )
-        updated_offsets = self.offsets[updated_slots]
 
         # Step 5: parallel update
         for l in range(1, self.L + 1):
             # Roll new data by their slots' offsets
             index = (
                 torch.arange(start=0, end=self.k**l, device=self.device).unsqueeze(0)
-                - (updated_offsets * self.k ** (l - 1)).unsqueeze(1)
+                - (self.offsets[updated_slots] * self.k ** (l - 1)).unsqueeze(1)
             ) % (self.k**l)
-            layer_nids, layer_eids, layer_tss = updated_layers[l]
+            layer_nids, layer_eids, layer_tss, layer_res, layer_degs = updated_layers[l]
             layer_nids_rolled = layer_nids.view(-1, self.k**l).gather(1, index)
             layer_eids_rolled = layer_eids.view(-1, self.k**l).gather(1, index)
             layer_tss_rolled = layer_tss.view(-1, self.k**l).gather(1, index)
+            layer_res_rolled = layer_res.view(-1, self.k**l).gather(1, index)
+            layer_degs_rolled = layer_degs.view(-1, self.k**l).gather(1, index)
 
             # Merge old data with new data
             mask = layer_nids_rolled != 0
@@ -490,10 +540,18 @@ class CGCache:
             merged_tss = torch.where(
                 mask, layer_tss_rolled, self.slots_tss[l][updated_slots]
             )
+            merged_res = torch.where(
+                mask, layer_res_rolled, self.slots_res[l][updated_slots]
+            )
+            merged_degs = torch.where(
+                mask, layer_degs_rolled, self.slots_degs[l][updated_slots]
+            )
 
             # Replace old slots with merged data
             self.slots_nids[l].index_copy_(0, updated_slots, merged_nids)
             self.slots_eids[l].index_copy_(0, updated_slots, merged_eids)
             self.slots_tss[l].index_copy_(0, updated_slots, merged_tss)
+            self.slots_res[l].index_copy_(0, updated_slots, merged_res)
+            self.slots_degs[l].index_copy_(0, updated_slots, merged_degs)
             pass
         pass

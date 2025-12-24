@@ -88,6 +88,8 @@ def run(
         device = torch.device("cpu")
     else:
         device = torch.device(f"cuda:{gpu}")
+    
+    print(f"Using device: {device}")
 
     restart_mode = restart_prob > 0
 
@@ -161,10 +163,7 @@ def run(
             val_warmup_dl,
             test_warmup_dl,
         ) = dls
-        (
-            train_collator,
-            eval_collator
-        ) = opt
+        (train_collator, eval_collator) = opt
 
         # ============= Init Model ===========
         model = init_model(
@@ -212,6 +211,7 @@ def run(
 
         early_stopper = EarlyStopMonitor(max_round=patience, epoch_start=epoch_start)
         for epoch in range(epoch_start, n_epochs):
+            path_tracings = debug.profile_dir / f"epoch{epoch}"
             prof_ctx = (
                 torch.profiler.profile(
                     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -219,7 +219,7 @@ def run(
                     record_shapes=True,
                     with_stack=True,
                     on_trace_ready=tensorboard_trace_handler(
-                        f"./tracings/epoch_{epoch}_train"
+                        str(path_tracings.absolute())
                     ),
                 )
                 if debug.ifprofile
@@ -276,23 +276,49 @@ def run(
                         )
                         uptodate_nodes.update(restart_nodes)
 
-                    with record_function("model computation"):
-                        contrast_loss, mutual_loss = model.contrast_and_mutual_learning(
-                            src_ids,
-                            dst_ids,
-                            neg_dst_ids,
-                            ts,
-                            eids,
-                            comp_graph,
-                            contrast_only=(restart_prob == 0),
-                        )
+                    contrast_loss, mutual_loss = model.contrast_and_mutual_learning(
+                        src_ids,
+                        dst_ids,
+                        neg_dst_ids,
+                        ts,
+                        eids,
+                        comp_graph,
+                        contrast_only=(restart_prob == 0),
+                    )
                     loss = contrast_loss + mutual_coef * mutual_loss
                     loss.backward()
                     optimizer.step()
                     m_contrast_loss.append(contrast_loss.item())
                     m_mutual_loss.append(mutual_loss.item())
                     m_loss.append(loss.item())
+                    
                     prof.step()
+
+            import matplotlib.pyplot as plt
+
+            # Example data
+            data = train_collator.cache_hits
+
+            # Create the plot
+            plt.figure(figsize=(12, 6))
+            x = np.arange(1, len(data) + 1)
+            plt.plot(
+                x,
+                data,
+                label="Values",
+                linestyle="-",
+                color="tomato",
+                linewidth=1,
+            )
+            plt.title("Cache hits")
+            plt.xlabel("Index")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+
+            # Save as image (PNG)
+            plt.savefig(path_tracings / "cache_hits.png", dpi=300, bbox_inches="tight")
 
             epoch_time = time.time() - start_epoch_t0
             epoch_times.append(epoch_time)
@@ -460,7 +486,7 @@ def get_args():
         "--prefix", type=str, default="", help="Prefix to name the checkpoints"
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--gpu", type=str, default="-1", help="Cuda index")
+    parser.add_argument("--gpu", type=str, default="0", help="Cuda index")
     # Data
     parser.add_argument(
         "--subset", type=float, default=1.0, help="Only use a subset of training data"
@@ -533,6 +559,8 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
 
+    debug.setup(args)
+
     run(
         0,
         1,
@@ -574,3 +602,5 @@ if __name__ == "__main__":
         async_cache=args.async_cache,
         redo_NS=args.redo_NS,
     )
+
+    debug.run.finish()
