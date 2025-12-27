@@ -231,8 +231,6 @@ def run(
                 logger.info("Start {} epoch".format(epoch))
 
                 m_loss = []
-                m_contrast_loss = []
-                m_mutual_loss = []
                 # it = BackgroundThreadGenerator(train_dl)
                 it = train_dl
                 it = tqdm.tqdm(it, total=len(train_dl), ncols=50)
@@ -288,8 +286,6 @@ def run(
                     loss = contrast_loss + mutual_coef * mutual_loss
                     loss.backward()
                     optimizer.step()
-                    m_contrast_loss.append(contrast_loss.item())
-                    m_mutual_loss.append(mutual_loss.item())
                     m_loss.append(loss.item())
                     
                     prof.step()
@@ -375,8 +371,6 @@ def run(
             )
             logger.info("Epoch {:4d} training took  {:.2f}s".format(epoch, epoch_time))
             logger.info(f"Epoch mean    total loss: {np.mean(m_loss):.4f}")
-            logger.info(f"Epoch mean contrast loss: {np.mean(m_contrast_loss):.4f}")
-            logger.info(f"Epoch mean   mutual loss: {np.mean(m_mutual_loss):.4f}")
             logger.info(f"Val     ap: {val_ap:.4f}, Val     auc: {val_auc:.4f}")
             logger.info(f"Val ind ap: {ind_val_ap:.4f}, Val ind auc: {ind_val_auc:.4f}")
 
@@ -541,13 +535,11 @@ def get_args():
     parser.add_argument(
         "--async_cache",
         action="store_true",
-        default=False,
         help="Whether to use async cache",
     )
     parser.add_argument(
         "--redo_NS",
         action="store_true",
-        default=False,
         help="Whether to redo negative sampling",
     )
 

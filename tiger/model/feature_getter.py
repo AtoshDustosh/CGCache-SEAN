@@ -72,6 +72,7 @@ class NumericalFeature(nn.Module):
                 self.register_buffer("efeats", efeats, persistent=False)
             else:
                 self.efeats = efeats
+            
 
         self.out_dim = dim
 

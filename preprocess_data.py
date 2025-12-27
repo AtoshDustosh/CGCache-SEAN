@@ -100,6 +100,8 @@ def run_opted(data_name, bipartite=True):
                 e = line.strip().split(",")
                 dim_efeat = len(e) - 4
             num_edges += 1
+    pad_efeat = True if dim_efeat == 0 else False
+    dim_efeat = 2 if dim_efeat == 0 else dim_efeat
 
     dtype_efeat = np.bool_ if data_name == "GDELT" else float
     efeat_mmap = np.lib.format.open_memmap(
@@ -133,11 +135,14 @@ def run_opted(data_name, bipartite=True):
                     count=dim_efeat,
                 )
             else:
-                efeat_mmap[idx + 1] = np.fromiter(
-                    (float(x) for x in e[4:]),
-                    dtype=dtype_efeat,
-                    count=dim_efeat,
-                )
+                if pad_efeat:
+                    efeat_mmap[idx + 1] = np.zeros([1], dtype=dtype_efeat)
+                else:
+                    efeat_mmap[idx + 1] = np.fromiter(
+                        (float(x) for x in e[4:]),
+                        dtype=dtype_efeat,
+                        count=dim_efeat,
+                    )
 
             u_list.append(u)
             i_list.append(i)
@@ -148,11 +153,13 @@ def run_opted(data_name, bipartite=True):
         {"u": u_list, "i": i_list, "ts": ts_list, "label": label_list, "idx": idx_list}
     )
 
+    print("Reindexing ...")
     new_df = reindex(df, bipartite)
 
     max_idx = max(new_df.u.max(), new_df.i.max())
     rand_feat = np.zeros((max_idx + 1, 172))
 
+    print("Saving files ...")
     new_df.to_csv(OUT_DF)
     np.save(OUT_NODE_FEAT, rand_feat)
 

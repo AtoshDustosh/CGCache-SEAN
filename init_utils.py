@@ -30,7 +30,9 @@ def init_parser():
     parser.add_argument(
         "-d", "--data", type=str, default="wikipedia", help="Dataset name"
     )
-    parser.add_argument("--root", type=str, default="/workspaces/CGCache-SEAN/", help="Dataset root")
+    parser.add_argument(
+        "--root", type=str, default="/workspaces/CGCache-SEAN/", help="Dataset root"
+    )
     parser.add_argument("--dim", type=int, default=None, help="Feature dimension")
     parser.add_argument(
         "--no_feat_buffer", action="store_true", help="Do not pre-load data into GPU"
@@ -321,5 +323,36 @@ def init_model(
         shift_max=shift_max,
         threshold=threshold,
         adl_control=adl_control,
-    ).to(device)
+    )
+
+    def print_model_parameters(model):
+        total = 0
+        for name, p in model.named_parameters():
+            n = p.numel()
+            size = n * p.element_size()
+            total += size
+            print(
+                f"[PARAM] {name:50s} shape={tuple(p.shape)!s:20s} "
+                f"dtype={p.dtype} size={size/1024**2:.2f} MB"
+            )
+
+        print(f"\nTotal parameters size: {total/1024**3:.2f} GB")
+
+    def print_model_buffers(model):
+        total = 0
+        for name, b in model.named_buffers():
+            n = b.numel()
+            size = n * b.element_size()
+            total += size
+            print(
+                f"[BUFFER] {name:50s} shape={tuple(b.shape)!s:20s} "
+                f"dtype={b.dtype} size={size/1024**2:.2f} MB"
+            )
+
+        print(f"\nTotal buffers size: {total/1024**3:.2f} GB")
+
+    print_model_parameters(model)
+    print_model_buffers(model)
+
+    model.to(device)
     return model

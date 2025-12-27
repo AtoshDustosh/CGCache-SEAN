@@ -265,12 +265,289 @@ class GraphCollator:
         )
 
     def _cg_update_daemon(self):
+        while True:
+            # Wait for batch data and masks
+            (
+                signal,
+                srcs,
+                dsts,
+                tss,
+                eids,
+                bs,
+                batch_nids,
+                n_unique,
+                uninids,
+                mask_uni2cached,
+                mask_uni2missed,
+                index_uni2batch,
+            ) = self.tqueue_main.get()
+            if signal != AsyncSignal.PARTITION_SENT:
+                raise RuntimeError(f"Invalid signal ({signal}) for batch partition")
+            # print(f"{threading.current_thread().name}: partition received")
+
+            # Retrieve cached_layers
+            unicached_nids = uninids[mask_uni2cached]
+            unimissed_nids = uninids[mask_uni2missed]
+            unicached_layers = self.cg_cache.fetch_cached(unicached_nids)
+
+            # Send cached_layers to the main thread
+            self.tqueue_cache.put((AsyncSignal.CACHED_SENT, unicached_layers))
+            # print(f"{threading.current_thread().name}: unicached sent")
+
+            # Execute cache eviction policy
+            mask_unimissed_put, unimissed_put_nids = self.cg_cache.exec_eviction(
+                bs, batch_nids, unimissed_nids
+            )
+
+            # Put missed nodes selectively
+            signal, unimissed_layers = self.tqueue_main.get()
+            if signal != AsyncSignal.MISSED_SENT:
+                raise RuntimeError(f"Invalid signal ({signal}) for missed layers")
+            # print(f"{threading.current_thread().name}: unimissed received")
+
+            self.cg_cache.put_missed(
+                unimissed_layers, mask_unimissed_put, unimissed_put_nids
+            )
+
+            # Incrementally update cache slots
+            # print(f"{threading.current_thread().name}: incrementally updating ...")
+            self.cg_cache.update_cached(srcs, dsts, eids, tss)
+            # print(f"{threading.current_thread().name}: incremental update finished")
         pass
 
     def collate_memory_nodes_with_cache_async(
         self, srcs, dsts, ndsts, tss, eids
     ) -> Tuple:
-        return None, None
+        batch_nids = np.concatenate([srcs, dsts, ndsts])
+        bs = len(tss)
+
+        # Partition the nodes into cached and missed
+        (
+            n_unique,
+            uninids,
+            mask_uni2cached,
+            mask_uni2missed,
+            index_uni2batch,
+            unicounts,
+        ) = self.cg_cache.partition_batch(batch_nids)
+
+        # Send masks to the background thread
+        self.tqueue_main.put(
+            (
+                AsyncSignal.PARTITION_SENT,
+                srcs,
+                dsts,
+                tss,
+                eids,
+                bs,
+                batch_nids,
+                n_unique,
+                uninids,
+                mask_uni2cached,
+                mask_uni2missed,
+                index_uni2batch,
+            )
+        )
+        # print(f"{threading.current_thread().name}: partition sent")
+
+        # Sample and fetch missed
+        unicached_nids = uninids[mask_uni2cached]
+        unimissed_nids = uninids[mask_uni2missed]
+        unimissed_layers: List[List] = [[] for _ in range(self.n_layers + 1)]
+        self._collate_memory_nodes_recursive(
+            unimissed_nids,
+            np.full_like(unimissed_nids, min(tss), dtype=float),
+            self.n_layers,
+            unimissed_layers,
+        )
+        unimissed_layers[0] = [
+            unimissed_nids,
+            np.array([]),
+            np.array([]),
+            np.array([]),  # re
+            np.array([]),  # deg
+        ]
+
+        for depth in range(len(unimissed_layers)):
+            ngh_nids, ngh_eids, ngh_tss, ngh_res, ngh_degs = unimissed_layers[depth]
+            unimissed_layers[depth] = [
+                torch.from_numpy(ngh_nids).long().to(self.cg_cache.device),
+                torch.from_numpy(ngh_eids).long().to(self.cg_cache.device),
+                torch.from_numpy(ngh_tss).float().to(self.cg_cache.device),
+                torch.from_numpy(ngh_res).float().to(self.cg_cache.device),
+                torch.from_numpy(ngh_degs).float().to(self.cg_cache.device),
+            ]
+
+        # Get cached_layers from the background thread
+        signal, unicached_layers = self.tqueue_cache.get()
+        if signal != AsyncSignal.CACHED_SENT:
+            raise RuntimeError(f"Invalid signal ({signal}) for cached layers")
+        # print(f"{threading.current_thread().name}: unicached received")
+
+        # Send missed_layers to the background thread
+        self.tqueue_main.put((AsyncSignal.MISSED_SENT, unimissed_layers))
+        # print(f"{threading.current_thread().name}: unimissed sent")
+
+        # Prepare the index to unmix unicached and unimissed back to uninids
+        index_uni2cached = mask_uni2cached.nonzero()[0]
+        index_uni2missed = mask_uni2missed.nonzero()[0]
+        index_partition = torch.from_numpy(
+            np.concatenate([index_uni2cached, index_uni2missed])
+        ).to(self.cg_cache.device)
+        index_unmix = index_partition.scatter(
+            0, index_partition, torch.arange(n_unique, device=self.cg_cache.device)
+        )
+        inv_uni2batch = (
+            torch.from_numpy(index_uni2batch).long().to(self.cg_cache.device)
+        )
+
+        # Concatenate unicached_layers and unimissed_layers, unmix them, and inverse unique
+        layers: List = []
+        # Prepare the 0th layer
+        unmixed_0 = torch.concatenate(
+            [unicached_layers[0][0], unimissed_layers[0][0]], dim=0
+        ).gather(0, index_unmix)
+        layers.append(
+            [
+                torch.gather(unmixed_0, 0, inv_uni2batch),
+                # torch.from_numpy(eids).long().to(self.cg_cache.device).tile(3),
+                torch.tensor([]).long().to(self.cg_cache.device),
+                torch.from_numpy(tss).float().to(self.cg_cache.device).tile(3),
+                torch.tensor([]).float().to(self.cg_cache.device),
+                torch.tensor([]).float().to(self.cg_cache.device),
+            ]
+        )
+        # Prepare the higher layers
+        for l in range(1, self.n_layers + 1):
+            # Concat and unmix
+            unmixed_nids = torch.concatenate(
+                [
+                    unicached_layers[l][0].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                    unimissed_layers[l][0].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                ],
+                dim=0,
+            ).gather(
+                0,
+                index_unmix.unsqueeze(-1).expand(
+                    -1, self.n_neighbors ** (self.n_layers - l + 1)
+                ),
+            )
+            unmixed_eids = torch.concatenate(
+                [
+                    unicached_layers[l][1].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                    unimissed_layers[l][1].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                ],
+                dim=0,
+            ).gather(
+                0,
+                index_unmix.unsqueeze(-1).expand(
+                    -1, self.n_neighbors ** (self.n_layers - l + 1)
+                ),
+            )
+            unmixed_tss = torch.concatenate(
+                [
+                    unicached_layers[l][2].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                    unimissed_layers[l][2].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                ],
+                dim=0,
+            ).gather(
+                0,
+                index_unmix.unsqueeze(-1).expand(
+                    -1, self.n_neighbors ** (self.n_layers - l + 1)
+                ),
+            )
+            unmixed_res = torch.concatenate(
+                [
+                    unicached_layers[l][3].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                    unimissed_layers[l][3].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                ],
+                dim=0,
+            ).gather(
+                0,
+                index_unmix.unsqueeze(-1).expand(
+                    -1, self.n_neighbors ** (self.n_layers - l + 1)
+                ),
+            )
+            unmixed_degs = torch.concatenate(
+                [
+                    unicached_layers[l][4].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                    unimissed_layers[l][4].view(
+                        -1, self.n_neighbors ** (self.n_layers - l + 1)
+                    ),
+                ],
+                dim=0,
+            ).gather(
+                0,
+                index_unmix.unsqueeze(-1).expand(
+                    -1, self.n_neighbors ** (self.n_layers - l + 1)
+                ),
+            )
+            # Inverse unique
+            layers.append(
+                [
+                    torch.gather(
+                        unmixed_nids,
+                        0,
+                        inv_uni2batch.unsqueeze(-1).expand(
+                            -1, self.n_neighbors ** (self.n_layers - l + 1)
+                        ),
+                    ).view(-1, self.n_neighbors),
+                    torch.gather(
+                        unmixed_eids,
+                        0,
+                        inv_uni2batch.unsqueeze(-1).expand(
+                            -1, self.n_neighbors ** (self.n_layers - l + 1)
+                        ),
+                    ).view(-1, self.n_neighbors),
+                    torch.gather(
+                        unmixed_tss,
+                        0,
+                        inv_uni2batch.unsqueeze(-1).expand(
+                            -1, self.n_neighbors ** (self.n_layers - l + 1)
+                        ),
+                    ).view(-1, self.n_neighbors),
+                    torch.gather(
+                        unmixed_res,
+                        0,
+                        inv_uni2batch.unsqueeze(-1).expand(
+                            -1, self.n_neighbors ** (self.n_layers - l + 1)
+                        ),
+                    ).view(-1, self.n_neighbors),
+                    torch.gather(
+                        unmixed_degs,
+                        0,
+                        inv_uni2batch.unsqueeze(-1).expand(
+                            -1, self.n_neighbors ** (self.n_layers - l + 1)
+                        ),
+                    ).view(-1, self.n_neighbors),
+                ]
+            )
+            pass
+        pass
+
+        all_nids = torch.cat([nids.flatten() for nids, _, _, _, _ in layers])
+        all_uni_nids = torch.unique(all_nids).cpu().numpy()
+
+        self.cache_hits.append(sum(unicounts[mask_uni2cached]) / (bs * 3))
+        return layers, all_uni_nids
 
     def collate_memory_nodes_with_cache_sync(
         self, srcs, dsts, ndsts, tss, eids
@@ -365,9 +642,6 @@ class GraphCollator:
         # Prepare the higher layers
         for l in range(1, self.n_layers + 1):
             # Concat and unmix
-            # print(unicached_layers[l][0].shape)
-            # print(unimissed_layers[l][0].shape)
-            # print(index_unmix.shape)
             unmixed_nids = torch.concatenate(
                 [
                     unicached_layers[l][0].view(

@@ -92,6 +92,9 @@ class CGCache:
                 )
             )
 
+        # Temporary objects to reduce redundant operations
+        self.old_keys = list(self.mapping.keys())
+
         print(f"cg cache initialized with cap {self.cap}")
         pass
 
@@ -155,7 +158,9 @@ class CGCache:
         )
         n_unique = len(uninids)
 
-        mask_uni2cached = np.isin(uninids, list(self.mapping.keys()))
+        self.old_keys = list(self.mapping.keys())
+
+        mask_uni2cached = np.isin(uninids, self.old_keys, assume_unique=True)
         mask_uni2missed = ~mask_uni2cached
 
         return (
@@ -239,14 +244,14 @@ class CGCache:
             mask_unimissed_put: mask from unique missed to put.
             unimissed_put_nids: which unique missed nids' layers should be put in cache.
         """
+        # OPT Possible pitfall for large batch size and large capacity
         srcs = batch_nids[:bs]
         dsts = batch_nids[bs : 2 * bs]
         ndsts = batch_nids[-bs:]
 
         # Save old nodes' slots for later reordering
-        old_keys = np.array(list(self.mapping.keys()))
         reorder_nids = np.zeros([self.cap], dtype=int)
-        for nid in old_keys:
+        for nid in self.old_keys:
             reorder_nids[self.mapping[nid]] = nid
 
         if self.policy == "lru":
@@ -268,16 +273,23 @@ class CGCache:
             raise NotImplementedError
 
         new_keys = np.array(list(self.mapping.keys()))
-        mask_unimissed_put = np.isin(unimissed, new_keys)
+        mask_unimissed_put = np.isin(unimissed, new_keys, assume_unique=True)
         unimissed_put_nids = unimissed[mask_unimissed_put]
 
         # Must use the to-be-put slots to avoid overwriting old data
         default_slot = (
             0 if len(unimissed_put_nids) == 0 else self.mapping[unimissed_put_nids[0]]
         )
-        reorder_index = torch.tensor(
-            [self.mapping.get(nid, default_slot) for nid in reorder_nids],
-            device=self.device,
+        reorder_index = (
+            torch.from_numpy(
+                np.fromiter(
+                    (self.mapping.get(nid, default_slot) for nid in reorder_nids),
+                    dtype=int,
+                    count=len(reorder_nids),
+                )
+            )
+            .long()
+            .to(self.device)
         )
 
         # Reorder slot data and offsets after cache eviction
