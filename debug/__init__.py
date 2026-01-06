@@ -70,11 +70,17 @@ def _setup_wandb(args):
 
 profiler_schedule = schedule(
     wait=100,
-    warmup=10,
+    warmup=50,
     active=1,
-    repeat=10,
-    skip_first=20,
+    repeat=5,
+    skip_first=80,
     skip_first_wait=1,
+    # wait=0,
+    # warmup=0,
+    # active=1,
+    # repeat=5,
+    # skip_first=0,
+    # skip_first_wait=0,
 )
 profile_dir = Path()
 

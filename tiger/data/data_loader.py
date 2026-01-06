@@ -62,8 +62,6 @@ class ChunkSampler(Sampler):
 
 class GraphCollator:
 
-    device: torch.device
-
     def __init__(
         self,
         graph: Graph,
@@ -102,6 +100,7 @@ class GraphCollator:
         self.async_cache = async_cache
         self.redo_NS = redo_NS
         if async_cache:
+            self.cache_stream = torch.cuda.Stream(device=cache_device, priority=1)
             self.tqueue_main = Queue()
             self.tqueue_cache = Queue()
             self.cg_thread = threading.Thread(
@@ -153,6 +152,12 @@ class GraphCollator:
                     # print(self.cg_cache.debug_log())
                     pass
 
+        with record_function("tiger data"):
+            restart_data = self.collate_restart_data(
+                np.concatenate([src_ids, dst_ids]), np.tile(tss, 2)
+            )
+            hit_data = self.collate_hit_data(src_ids, dst_ids, neg_dst_ids, tss)
+
         with record_function("cg sampling"):
             if self.cg_cache.cap != 0:
                 if self.async_cache:
@@ -168,10 +173,6 @@ class GraphCollator:
                 layers, unique_ids = self.collate_memory_nodes(
                     np.concatenate([src_ids, dst_ids, neg_dst_ids]), np.tile(tss, 3)
                 )
-            restart_data = self.collate_restart_data(
-                np.concatenate([src_ids, dst_ids]), np.tile(tss, 2)
-            )
-            hit_data = self.collate_hit_data(src_ids, dst_ids, neg_dst_ids, tss)
 
             computation_graph = ComputationGraph(
                 [layers, unique_ids], restart_data, hit_data, self.n_nodes
@@ -264,60 +265,75 @@ class GraphCollator:
             neigh_nids.flatten(), neigh_ts.flatten(), depth - 1, layers
         )
 
+    @torch.no_grad()
     def _cg_update_daemon(self):
-        while True:
-            # Wait for batch data and masks
-            (
-                signal,
-                srcs,
-                dsts,
-                tss,
-                eids,
-                bs,
-                batch_nids,
-                n_unique,
-                uninids,
-                mask_uni2cached,
-                mask_uni2missed,
-                index_uni2batch,
-            ) = self.tqueue_main.get()
-            if signal != AsyncSignal.PARTITION_SENT:
-                raise RuntimeError(f"Invalid signal ({signal}) for batch partition")
-            # print(f"{threading.current_thread().name}: partition received")
+        with torch.cuda.stream(self.cache_stream):
+            while True:
+                # Wait for batch data and masks
+                (
+                    signal,
+                    srcs,
+                    dsts,
+                    tss,
+                    ndsts,
+                    eids,
+                    bs,
+                    batch_nids,
+                    n_unique,
+                    uninids,
+                    mask_uni2cached,
+                    mask_uni2missed,
+                    index_uni2batch,
+                ) = self.tqueue_main.get()
+                if signal != AsyncSignal.PARTITION_SENT:
+                    raise RuntimeError(f"Invalid signal ({signal}) for batch partition")
+                # print(f"{threading.current_thread().name}: partition received")
 
-            # Retrieve cached_layers
-            unicached_nids = uninids[mask_uni2cached]
-            unimissed_nids = uninids[mask_uni2missed]
-            unicached_layers = self.cg_cache.fetch_cached(unicached_nids)
+                # Retrieve cached_layers
+                unicached_nids = uninids[mask_uni2cached]
+                unimissed_nids = uninids[mask_uni2missed]
+                unicached_layers = self.cg_cache.fetch_cached(unicached_nids)
 
-            # Send cached_layers to the main thread
-            self.tqueue_cache.put((AsyncSignal.CACHED_SENT, unicached_layers))
-            # print(f"{threading.current_thread().name}: unicached sent")
+                # Send cached_layers to the main thread
+                self.tqueue_cache.put((AsyncSignal.CACHED_SENT, unicached_layers))
+                # print(f"{threading.current_thread().name}: unicached sent")
 
-            # Execute cache eviction policy
-            mask_unimissed_put, unimissed_put_nids = self.cg_cache.exec_eviction(
-                bs, batch_nids, unimissed_nids
-            )
+                # Execute cache eviction policy
+                mask_unimissed_put, unimissed_put_nids = self.cg_cache.exec_eviction(
+                    srcs, dsts, ndsts, unimissed_nids
+                )
 
-            # Put missed nodes selectively
-            signal, unimissed_layers = self.tqueue_main.get()
-            if signal != AsyncSignal.MISSED_SENT:
-                raise RuntimeError(f"Invalid signal ({signal}) for missed layers")
-            # print(f"{threading.current_thread().name}: unimissed received")
+                # Put missed nodes selectively
+                signal, unimissed_layers = self.tqueue_main.get()
+                if signal != AsyncSignal.MISSED_SENT:
+                    raise RuntimeError(f"Invalid signal ({signal}) for missed layers")
+                # print(f"{threading.current_thread().name}: unimissed received")
 
-            self.cg_cache.put_missed(
-                unimissed_layers, mask_unimissed_put, unimissed_put_nids
-            )
+                self.cg_cache.put_missed(
+                    unimissed_layers, mask_unimissed_put, unimissed_put_nids
+                )
 
-            # Incrementally update cache slots
-            # print(f"{threading.current_thread().name}: incrementally updating ...")
-            self.cg_cache.update_cached(srcs, dsts, eids, tss)
-            # print(f"{threading.current_thread().name}: incremental update finished")
+                # Incrementally update cache slots
+                # print(f"{threading.current_thread().name}: incrementally updating ...")
+                # signal = self.tqueue_main.get()
+                # if signal != AsyncSignal.START_UPDATE:
+                #     raise RuntimeError(
+                #         f"Invalid signal ({signal}) for triggering updates"
+                #     )
+                self.cg_cache.update_cached(srcs, dsts, eids, tss)
+                # print(f"{threading.current_thread().name}: incremental update finished")
         pass
 
+    # def trigger_update_cgcache(self):
+    #     if self.cg_cache.cap > 0 and self.async_cache is True:
+    #         # print("*********** triggering async updates ***********")
+    #         self.tqueue_main.put(AsyncSignal.START_UPDATE)
+
+    @torch.no_grad()
     def collate_memory_nodes_with_cache_async(
         self, srcs, dsts, ndsts, tss, eids
     ) -> Tuple:
+        
         batch_nids = np.concatenate([srcs, dsts, ndsts])
         bs = len(tss)
 
@@ -337,6 +353,7 @@ class GraphCollator:
                 AsyncSignal.PARTITION_SENT,
                 srcs,
                 dsts,
+                ndsts,
                 tss,
                 eids,
                 bs,
@@ -549,6 +566,7 @@ class GraphCollator:
         self.cache_hits.append(sum(unicounts[mask_uni2cached]) / (bs * 3))
         return layers, all_uni_nids
 
+    @torch.no_grad()
     def collate_memory_nodes_with_cache_sync(
         self, srcs, dsts, ndsts, tss, eids
     ) -> Tuple:
@@ -600,7 +618,7 @@ class GraphCollator:
 
         # Execute cache eviction policy
         mask_unimissed_put, unimissed_put_nids = self.cg_cache.exec_eviction(
-            bs, batch_nids, unimissed_nids
+            srcs, dsts, ndsts, unimissed_nids
         )
 
         # Put missed nodes selectively

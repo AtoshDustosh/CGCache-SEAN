@@ -101,7 +101,7 @@ def run_opted(data_name, bipartite=True):
                 dim_efeat = len(e) - 4
             num_edges += 1
     pad_efeat = True if dim_efeat == 0 else False
-    dim_efeat = 2 if dim_efeat == 0 else dim_efeat
+    dim_efeat = 2 if pad_efeat else dim_efeat
 
     dtype_efeat = np.bool_ if data_name == "GDELT" else float
     efeat_mmap = np.lib.format.open_memmap(
@@ -114,6 +114,8 @@ def run_opted(data_name, bipartite=True):
     u_list, i_list, ts_list, label_list = [], [], [], []
     feat_l = []
     idx_list = []
+    cnt_error = 0
+    invalid_lines = []
     with open(PATH) as f:
         s = next(f)  # skip the first line (col names)
 
@@ -122,36 +124,45 @@ def run_opted(data_name, bipartite=True):
         efeat_mmap[0] = empty
         for idx, line in enumerate(tqdm(f, desc=f"Parsing {data_name}")):
             e = line.strip().split(",")
-            u = int(e[0])
-            i = int(e[1])
+            try:
+                u = int(e[0])
+                i = int(e[1])
 
-            ts = float(e[2])
-            label = float(e[3])
+                ts = float(e[2])
+                label = float(e[3])
 
-            if data_name == "GDELT":
-                efeat_mmap[idx + 1] = np.fromiter(
-                    (x == "1" for x in e[4:]),
-                    dtype=dtype_efeat,
-                    count=dim_efeat,
-                )
-            else:
-                if pad_efeat:
-                    efeat_mmap[idx + 1] = np.zeros([1], dtype=dtype_efeat)
-                else:
+                if data_name == "GDELT":
                     efeat_mmap[idx + 1] = np.fromiter(
-                        (float(x) for x in e[4:]),
+                        (x == "1" for x in e[4:]),
                         dtype=dtype_efeat,
                         count=dim_efeat,
                     )
+                else:
+                    if pad_efeat:
+                        efeat_mmap[idx + 1] = np.zeros([1], dtype=dtype_efeat)
+                    else:
+                        efeat_mmap[idx + 1] = np.fromiter(
+                            (float(x) for x in e[4:]),
+                            dtype=dtype_efeat,
+                            count=dim_efeat,
+                        )
 
-            u_list.append(u)
-            i_list.append(i)
-            ts_list.append(ts)
-            label_list.append(label)
-            idx_list.append(idx)
+                u_list.append(u)
+                i_list.append(i)
+                ts_list.append(ts)
+                label_list.append(label)
+                idx_list.append(idx)
+            except ValueError:
+                cnt_error += 1
+                invalid_lines.append(line)
+                continue
     df = pd.DataFrame(
         {"u": u_list, "i": i_list, "ts": ts_list, "label": label_list, "idx": idx_list}
     )
+
+    print("Invalid and skipped lines: ", cnt_error)
+    df_invalid = pd.DataFrame({"lines": invalid_lines})
+    df_invalid.to_csv("invalid_lines.csv")
 
     print("Reindexing ...")
     new_df = reindex(df, bipartite)

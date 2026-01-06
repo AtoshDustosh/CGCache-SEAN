@@ -88,7 +88,7 @@ def run(
         device = torch.device("cpu")
     else:
         device = torch.device(f"cuda:{gpu}")
-    
+
     print(f"Using device: {device}")
 
     restart_mode = restart_prob > 0
@@ -207,7 +207,6 @@ def run(
         ind_val_aucs = []
         epoch_times = []
         total_epoch_times = []
-        train_losses = []
 
         early_stopper = EarlyStopMonitor(max_round=patience, epoch_start=epoch_start)
         for epoch in range(epoch_start, n_epochs):
@@ -230,7 +229,6 @@ def run(
                 start_epoch_t0 = time.time()
                 logger.info("Start {} epoch".format(epoch))
 
-                m_loss = []
                 # it = BackgroundThreadGenerator(train_dl)
                 it = train_dl
                 it = tqdm.tqdm(it, total=len(train_dl), ncols=50)
@@ -257,7 +255,6 @@ def run(
                     eids = eids.long().to(device)
                     comp_graph.to(device)
                     optimizer.zero_grad()
-
                     # Restart
                     if np.random.rand() < restart_prob and i_batch:
                         restarting = True
@@ -283,11 +280,11 @@ def run(
                         comp_graph,
                         contrast_only=(restart_prob == 0),
                     )
+
                     loss = contrast_loss + mutual_coef * mutual_loss
                     loss.backward()
                     optimizer.step()
-                    m_loss.append(loss.item())
-                    
+
                     prof.step()
 
             import matplotlib.pyplot as plt
@@ -314,6 +311,7 @@ def run(
             plt.tight_layout()
 
             # Save as image (PNG)
+            path_tracings.mkdir(parents=True, exist_ok=True)
             plt.savefig(path_tracings / "cache_hits.png", dpi=300, bbox_inches="tight")
 
             epoch_time = time.time() - start_epoch_t0
@@ -370,7 +368,6 @@ def run(
                 "Epoch {:4d} total    took  {:.2f}s".format(epoch, total_epoch_time)
             )
             logger.info("Epoch {:4d} training took  {:.2f}s".format(epoch, epoch_time))
-            logger.info(f"Epoch mean    total loss: {np.mean(m_loss):.4f}")
             logger.info(f"Val     ap: {val_ap:.4f}, Val     auc: {val_auc:.4f}")
             logger.info(f"Val ind ap: {ind_val_ap:.4f}, Val ind auc: {ind_val_auc:.4f}")
 
@@ -378,7 +375,6 @@ def run(
             ind_val_aps.append(ind_val_ap)
             val_aucs.append(val_auc)
             ind_val_aucs.append(ind_val_auc)
-            train_losses.append(np.mean(m_loss))
 
             if early_stopper.early_stop_check(val_ap):
                 logger.info(
@@ -443,7 +439,6 @@ def run(
                 "test_auc": test_auc,
                 "ind_test_auc": ind_test_auc,
                 "epoch_times": epoch_times,
-                "train_losses": train_losses,
                 "total_epoch_times": total_epoch_times,
             },
             open(PICKLE_SAVE_PATH, "wb"),
@@ -521,16 +516,16 @@ def get_args():
         "--profile", action="store_true", default=False, help="Whether to profile"
     )
     parser.add_argument(
-        "--cg_cache",
-        type=float,
-        default=0.0,
-        help="If not 0.0, use sample cache with the given number as cache ratio to accelerate cg sampling.",
-    )
-    parser.add_argument(
         "--profile_dir",
         type=str,
         default="./tracings",
         help="The directory to store tracings.",
+    )
+    parser.add_argument(
+        "--cg_cache",
+        type=float,
+        default=0.0,
+        help="If not 0.0, use sample cache with the given number as cache ratio to accelerate cg sampling.",
     )
     parser.add_argument(
         "--async_cache",
